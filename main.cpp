@@ -3,7 +3,7 @@
 //----------------------------------------------------------------------------//
 
 // trigger optimisation from source file
-# pragma GCC optimize("Ofast", "inline", "omit-frame-pointer", "unroll-loops")
+// # pragma GCC optimize("Ofast", "inline", "omit-frame-pointer", "unroll-loops")
 #include <iostream>
 #include <string>
 #include <vector>
@@ -127,26 +127,39 @@ struct Group {
             }
             my_poss_by_common[poss_key].push_back(poss);
         }
-        std::cerr << "Group 1 by common key: " << my_poss_by_common << "\n";
+        std::cerr << "Group " << cells << " by common key: " << my_poss_by_common << "\n";
         std::vector<std::set<Pos>> new_possibilities;
+        std::cerr << "Group " << group->cells << " by common key:\n";
         for (std::set<Pos> const& g_poss: group->possibilities) {
             std::set<Pos> g_poss_key;
             for (Pos const& cell: common_cells) {
                 if (g_poss.find(cell) != end(g_poss)) {
                     g_poss_key.insert(cell);
-                    auto it = my_poss_by_common.find(g_poss_key);
-                    if (it == std::end(my_poss_by_common)) {
-                        continue;
-                    }
-                    for (std::set<Pos> const& g_poss: it->second) {
-                        new_possibilities.emplace_back(g_poss);
-                    }
                 }
             }
-
+            auto it = my_poss_by_common.find(g_poss_key);
+            std::cerr << "Poss " << g_poss << " (common: " << g_poss_key << ") Matches ";
+            if (it == std::end(my_poss_by_common)) {
+                std::cerr << "NONE\n";
+                continue;
+            }
+            std::cerr << it->second << "\n";
+            for (std::set<Pos> const& my_poss: it->second) {
+                new_possibilities.emplace_back(g_poss);
+                new_possibilities.back().merge(my_poss);
+            }
         }
+        cells.merge(group->cells);
         possibilities = new_possibilities;
-        cells.e(group->cells);
+    }
+
+    std::set<Pos> safe_cells(void) const {
+        std::set<Pos> res {cells};
+        for (auto const& poss: possibilities) {
+            for (Pos const& p: poss) {
+                res.remove(p);
+            }
+        }
     }
 };
 
@@ -178,9 +191,8 @@ std::ostream& operator<<(std::ostream& os, Group const& group) {
         y_min = std::min(y_min, coords.second);
         y_max = std::max(y_max, coords.second);
     }
-    size_t i = 0;
     for (std::set<Pos> const& possibility: group.possibilities) {
-        os << "Poss #" << std::to_string(++i) << "\n";
+        os << "Poss " << possibility << "\n";
         for (int y = y_min; y <= y_max; ++y) {
             os << "|";
             for (int x = x_min; x <= x_max; ++x) {
@@ -293,8 +305,7 @@ void compute_cell(Grid const& grid, Pos const& p, std::vector<Group*> & groups) 
         std::set<Pos> common_cells = intersection(c_group->cells, groups[gi]->cells);
         if (!common_cells.empty()) {
             c_group->merge(groups[gi], common_cells);
-            std::cerr << "Merging " << *(groups[gi]) << "\n";
-            std::cerr << " => " << *(c_group) << "\n";
+            std::cerr << "Merged => " << *(c_group) << "\n";
             delete groups[gi];
             groups[gi] = nullptr;
         }
