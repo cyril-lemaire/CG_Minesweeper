@@ -7,16 +7,24 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <array>
 #include <set>
 #include <map>
 #include <algorithm>
 #include <chrono>
+#include <thread>
+#include <mutex>
 
 
 constexpr int W = 30;
 constexpr int H = 16;
 
-typedef char Grid[W * H];
+constexpr auto TURN_DURATION = std::chrono::milliseconds(50);
+constexpr auto TIME_EPSILON = std::chrono::microseconds(1000);
+
+std::condition_variable player_cv;
+
+typedef std::array<char, W * H> Grid;
 typedef uint16_t Pos;
 
 /*
@@ -162,9 +170,28 @@ struct Group {
     //     }
     //     return res;
     // }
+    
+    void find_safe_cells(std::set<Pos> & safe_cells, std::mutex *const safe_cells_mtx) const {
+        std::unique_lock<std::mutex> safe_cells_lock {*safe_cells_mtx};
+        std::set<Pos> valid_cells {unknown_cells};
+        Pos res;
+        size_t best_safe_poss = 0;
 
-    Pos safest_cell(double & safety_level) const {
+        for (auto const& poss: possibilities) {
+            for (Pos p: poss) {
+                valid_cells.erase(p);
+            }
+        }
+        for (Pos p: valid_cells) {
+            safe_cells.insert(p);
+        }
+    }
+
+    void find_safest_cell(Pos & guess, double & guess_safety, std::mutex & guess_mtx, std::set<Pos> & safe_cells, std::mutex & safe_cells_mtx) const {
+        std::unique_lock<std::mutex> guess_lock {guess_mtx};
+        std::unique_lock<std::mutex> safe_cells_lock {safe_cells_mtx};
         std::map<Pos, size_t> cells_safety;
+        size_t best_safe_poss = 0;
 
         for (Pos p: unknown_cells) {
             cells_safety[p] = possibilities.size();
@@ -174,9 +201,21 @@ struct Group {
                 --cells_safety[p];
             }
         }
-        Pos res = *std::max_element(std::begin(unknown_cells), std::end(unknown_cells), [cells_safety](Pos p1, Pos p2) {return cells_safety.at(p1) < cells_safety.at(p2);});
-        safety_level = static_cast<double>(cells_safety[res]) / possibilities.size();
-        return res;
+        for (auto const& kv_pair: cells_safety) {
+            Pos const p = kv_pair.first;
+            double const p_safety = static_cast<double>(kv_pair.second) / possibilities.size();
+            if (p_safety >= guess_safety) {
+                if (p_safety == 1.0) {
+                    safe_cells_lock.lock();
+                    safe_cells.insert(p);
+                    safe_cells_lock.unlock();
+                }
+                guess_lock.lock();
+                guess = p;
+                guess_safety = p_safety;
+                guess_lock.unlock();
+            }
+        }
     }
 };
 
@@ -331,55 +370,71 @@ void compute_cell(Grid const& grid, Pos const& p, std::vector<Group*> & groups) 
     groups.push_back(c_group);
 }
 
-int main(void) {
-    std::set<Pos> computed_cells;
-    std::vector<Group*> groups;
-    Grid grid;
-    read_grid(grid);
-    std::cout << W / 2 << " " << H / 2 << std::endl;    // First move in the middle of the grid
+void player(Grid *const grid, std::vector<Pos> const to_compute, std::mutex * to_compute_mtx, std::set<Pos> safe_cells, std::mutex * safe_cells_mtx, Pos *const guess, double *const guess_safety, std::mutex * guess_mtx) {
+    std::unique_lock<std::mutex> to_compute_lock {*to_compute_mtx};
+    std::unique_lock<std::mutex> guess_lock {*guess_mtx};
 
     while (true) {
-        read_grid(grid);
+        player_cv.wait(to_compute_lock, [&to_compute]{return !to_compute.empty();});
+        std::vector<Group*> groups;
         // std::cerr << grid;
         // std::cerr << "Already computed cells: " << computed_cells << "\n";
-        for (Pos p = 0; p < W * H; ++p) {
-            if ('0' <= grid[p] && grid[p] <= '9' && computed_cells.find(p) == std::end(computed_cells)) {
-                std::cerr << "Computing cell " << p << " " << get_coords(p) << "\n";
-                computed_cells.insert(p);
-                compute_cell(grid, p, groups);
-            }
+        for (Pos p: to_compute) {
+            compute_cell(*grid, p, groups);
         }
-        Pos guess;
-        double guess_safety = 0.0;
+        *guess_safety = safe_cells.empty() ? 0.0 : 1.0;
         std::vector<Group *>::iterator guess_group_it = std::end(groups);
         // std::cerr << groups.size() << " groups.\n";
         for (auto group_it = std::begin(groups); group_it != std::end(groups); ++group_it) {
             Group const* g = *group_it;
             std::cerr << "Group #" << std::distance(std::begin(groups), group_it) + 1 << " (" << g->possibilities.size() << " possibilities), "
                     << g->possibilities.front().size() << " bombs, cells: " << g->unknown_cells << "\n";
-            double cell_safety;
-            Pos p = g->safest_cell(cell_safety);
-            if (cell_safety > guess_safety) {
-                guess = p;
-                guess_safety = cell_safety;
-                guess_group_it = group_it;
-                if (cell_safety == 1.0) {   // This cell is perfectly safe
-                    break;
-                }
+
+            if (!safe_cells.empty()) {   // We have some perfectly safe cells, no need for uncertain scenarii
+                g->find_safe_cells(safe_cells, safe_cells_mtx);
+            } else {
+                g->find_safest_cell(*guess, *guess_safety, guess_mtx, safe_cells, safe_cells_mtx);
             }
         }
-        std::pair<int, int> coords = get_coords(guess);
-        std::cerr << "Guess safety = " << guess_safety * 100.0 << "%\n"; 
+        std::pair<int, int> coords = get_coords(*guess);
+        std::cerr << "Guess safety = " << *guess_safety * 100.0 << "%\n"; 
         std::cout << coords.first << " " << coords.second << std::endl;
         Group * g = *guess_group_it;
 
-        std::cerr << "Forgetting cells " << g->known_cells << "\n";
-        for (Pos const& p: g->known_cells) {
-            computed_cells.erase(p);
-        }
-        groups.erase(guess_group_it);
+        // std::cerr << "Forgetting cells " << g->known_cells << "\n";
+        // for (Pos const& p: g->known_cells) {
+        //     computed_cells.erase(p);
+        // }
+        // groups.erase(guess_group_it);
         // delete g;
         // throw std::runtime_error("stop after first turn!");
     }
+}
+
+int main(void) {
+    std::set<Pos> unseen_cells;
+    std::vector<Pos> to_compute;
+    std::set<Pos> safe_cells;
+    Pos guess;
+    double guess_safety;
+    Grid grid;
+    read_grid(grid);
+    std::cout << W / 2 << " " << H / 2 << std::endl;    // First move in the middle of the grid
+    auto my_player = std::thread(player, &grid, to_compute, safe_cells, &guess, &guess_safety);
+
+    while (true) {
+        read_grid(grid);
+        auto turn_start = std::chrono::high_resolution_clock::now();
+        auto turn_end = turn_start + TURN_DURATION - TIME_EPSILON;
+        std::this_thread::sleep_until(turn_end);
+    }
     return (0);
 }
+
+/**
+ * Properties of:
+ * main: grid, to_compute
+ * search: computed, safe_cells, guess, guess_safety
+ * 
+ * 
+ */
