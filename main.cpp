@@ -8,47 +8,31 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <array>
 #include <map>
+#include <queue>
 #include <algorithm>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <functional>
 
 
 constexpr int W = 30;
 constexpr int H = 16;
+constexpr int CELLS_COUNT = W * H;
 
-typedef char Grid[W * H];
+constexpr std::chrono::duration FIRST_TURN_DURATION = std::chrono::seconds(1);
+constexpr std::chrono::duration TURN_DURATION = std::chrono::milliseconds(50);
+constexpr std::chrono::duration TIME_EPSILON = std::chrono::microseconds(1000);
+
+std::condition_variable game_player_cv;
+
+typedef std::array<char, CELLS_COUNT> Grid;
 typedef uint16_t Pos;
 
-/*
-struct Pos {
-    int x, y;
-
-    int cmp(Pos const& p) const {
-        return (x - p.x || y - p.y);
-    }
-    bool operator==(Pos const& p) const {
-        return (cmp(p) == 0);
-    }
-    bool operator!=(Pos const& p) const {
-        return (cmp(p) != 0);
-    }
-    bool operator<(Pos const& p) const {
-        return (cmp(p) < 0);
-    }
-    bool operator<=(Pos const& p) const {
-        return (cmp(p) <= 0);
-    }
-    bool operator>(Pos const& p) const {
-        return (cmp(p) > 0);
-    }
-    bool operator>=(Pos const& p) const {
-        return (cmp(p) >= 0);
-    }
-};
-*/
-
 inline Pos get_pos(int x, int y) {
-    if (x < 0 ||x >= W || y < 0 || y >= H) {
+    if (x < 0 || x >= W || y < 0 || y >= H) {
         throw std::runtime_error(std::string("Error! Invalid coordinates [x") + std::to_string(x) + ", y" + std::to_string(y) + "]");
     }
     return y * W + x;
@@ -59,7 +43,7 @@ inline Pos get_pos(std::pair<int, int> const& c) {
 }
 
 inline std::pair<int, int> get_coords(Pos const& p) {
-    if (p >= W * H) {
+    if (p >= CELLS_COUNT) {
         throw std::runtime_error(std::string("Error! Invalid Pos [") + std::to_string(p) + "]");
     }
     return {p % W, p / W};
@@ -154,30 +138,6 @@ struct Group {
         unknown_cells.insert(std::begin(group->unknown_cells), std::end(group->unknown_cells));
         possibilities = new_possibilities;
     }
-
-    // std::set<Pos> safe_cells(void) const {
-    //     std::set<Pos> res {unknown_cells};
-    //     for (auto const& poss: possibilities) {
-    //         res.erase(std::begin(poss), std::end(poss));
-    //     }
-    //     return res;
-    // }
-
-    Pos safest_cell(double & safety_level) const {
-        std::map<Pos, size_t> cells_safety;
-
-        for (Pos p: unknown_cells) {
-            cells_safety[p] = possibilities.size();
-        }
-        for (auto const& poss: possibilities) {
-            for (Pos p: poss) {
-                --cells_safety[p];
-            }
-        }
-        Pos res = *std::max_element(std::begin(unknown_cells), std::end(unknown_cells), [cells_safety](Pos p1, Pos p2) {return cells_safety.at(p1) < cells_safety.at(p2);});
-        safety_level = static_cast<double>(cells_safety[res]) / possibilities.size();
-        return res;
-    }
 };
 
 std::ostream& operator<<(std::ostream& os, Grid const& grid) {
@@ -248,27 +208,37 @@ std::set<T> intersection(std::set<T> const& a, std::set<T> const& b) {
     return res;
 }
 
-int cell_val(Grid const& grid, Pos const& p) {
-    char cell_char = grid[p];
-    int val;
-
+int cell_val(char cell_char) {
     switch (cell_char) {
         case '?':
-            val = -1;
-            break;
+            return -1;
         case '.':
-            val = 0;
-            break;
+            return 0;
+        case '1':
+            [[fallthrough]];
+        case '2':
+            [[fallthrough]];
+        case '3':
+            [[fallthrough]];
+        case '4':
+            [[fallthrough]];
+        case '5':
+            [[fallthrough]];
+        case '6':
+            [[fallthrough]];
+        case '7':
+            [[fallthrough]];
+        case '8':
+            return cell_char - '0';
         default:
-            val = cell_char - '0';
-            break;
+            throw std::runtime_error("Error! Invalid cell value [" + std::to_string(cell_char) + "]");
     }
-    return val;
 }
 
 /**
- * @brief Note for optimisation purpose, p is its own neighbour.
- * Should have no practical impact as this function is always called on numbered cells.
+ * @brief Counts neighbour of p in grid.
+ * Note: for optimisation purpose, p is considered its own neighbour.
+ * Should have no practical impact as this function is always called on numbered - thus revealed - cells.
  */
 template<class OutputIterator>
 OutputIterator unknown_neighbours(Grid const& grid, Pos const& p, OutputIterator const res) {
@@ -287,9 +257,9 @@ OutputIterator unknown_neighbours(Grid const& grid, Pos const& p, OutputIterator
     return (it);
 }
 
-Group * cell_group(Grid const& grid, Pos const& p) {
+Group * raw_cell_group(Grid const& grid, Pos const& p) {
     static Pos neighbours[8];
-    size_t bombs_around = cell_val(grid, p);
+    size_t bombs_around = cell_val(grid[p]);
     auto neighbours_end = unknown_neighbours(grid, p, std::begin(neighbours));
     size_t neighbours_count = std::distance(std::begin(neighbours), neighbours_end);
     Group * group = new Group({p}, {std::begin(neighbours), neighbours_end});
@@ -312,9 +282,9 @@ Group * cell_group(Grid const& grid, Pos const& p) {
     return (group);
 }
 
-void compute_cell(Grid const& grid, Pos const& p, std::vector<Group*> & groups) {
+Group * get_cell_group(Grid const& grid, Pos const& p, std::vector<Group*> & groups) {
     std::vector<int> to_del;
-    Group * c_group = cell_group(grid, p);
+    Group * c_group = raw_cell_group(grid, p);
 
     // std::cerr << "cell_group(" << p << ") = " << *c_group << "\n";
     for (size_t gi = 0; gi < groups.size(); ++gi) {
@@ -329,57 +299,128 @@ void compute_cell(Grid const& grid, Pos const& p, std::vector<Group*> & groups) 
     auto it = std::remove(std::begin(groups), std::end(groups), nullptr);
     groups.erase(it, std::end(groups));
     groups.push_back(c_group);
+    return c_group;
 }
 
-int main(void) {
+void game_interface(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_compute, std::mutex to_compute_mtx, std::queue<Pos> & to_play, Pos & to_guess, std::mutex & to_play_mtx) {
+    std::chrono::high_resolution_clock::time_point turn_start;
+    std::chrono::high_resolution_clock::time_point turn_end;
     std::set<Pos> computed_cells;
-    std::vector<Group*> groups;
-    Grid grid;
+    Pos played_pos;
+
+    to_guess = W * H;   // This indicates the game_player that the guess was played.
     read_grid(grid);
     std::cout << W / 2 << " " << H / 2 << std::endl;    // First move in the middle of the grid
 
     while (true) {
-        read_grid(grid);
-        // std::cerr << grid;
-        // std::cerr << "Already computed cells: " << computed_cells << "\n";
-        for (Pos p = 0; p < W * H; ++p) {
-            if ('0' <= grid[p] && grid[p] <= '9' && computed_cells.find(p) == std::end(computed_cells)) {
-                std::cerr << "Computing cell " << p << " " << get_coords(p) << "\n";
-                computed_cells.insert(p);
-                compute_cell(grid, p, groups);
-            }
+        {
+            std::lock_guard<std::mutex> lck(grid_mtx);  // Only this thread can write, block against concurrent read access 
+            read_grid(grid);
         }
-        Pos guess;
-        double guess_safety = 0.0;
-        std::vector<Group *>::iterator guess_group_it = std::end(groups);
-        // std::cerr << groups.size() << " groups.\n";
-        for (auto group_it = std::begin(groups); group_it != std::end(groups); ++group_it) {
-            Group const* g = *group_it;
-            std::cerr << "Group #" << std::distance(std::begin(groups), group_it) + 1 << " (" << g->possibilities.size() << " possibilities), "
-                    << g->possibilities.front().size() << " bombs, cells: " << g->unknown_cells << "\n";
-            double cell_safety;
-            Pos p = g->safest_cell(cell_safety);
-            if (cell_safety > guess_safety) {
-                guess = p;
-                guess_safety = cell_safety;
-                guess_group_it = group_it;
-                if (cell_safety == 1.0) {   // This cell is perfectly safe
-                    break;
+        turn_start = std::chrono::high_resolution_clock::now();
+        turn_end = turn_start + TURN_DURATION;
+        for (Pos p = 0; p < CELLS_COUNT; ++p) {
+            if ('1' <= grid[p] && grid[p] <= '1' && computed_cells.find(p) == std::end(computed_cells)) {
+                {
+                    std::lock_guard<std::mutex> lck(to_compute_mtx);
+                    to_compute.push(p);
+                    computed_cells.insert(p);
+                    game_player_cv.notify_one();
                 }
             }
         }
-        std::pair<int, int> coords = get_coords(guess);
-        std::cerr << "Guess safety = " << guess_safety * 100.0 << "%\n"; 
-        std::cout << coords.first << " " << coords.second << std::endl;
-        Group * g = *guess_group_it;
-
-        std::cerr << "Forgetting cells " << g->known_cells << "\n";
-        for (Pos const& p: g->known_cells) {
-            computed_cells.erase(p);
+        std::this_thread::sleep_until(turn_end - TIME_EPSILON);
+        {
+            std::lock_guard<std::mutex> lck(to_play_mtx);
+            if (!to_play.empty()) {
+                played_pos = to_play.front();
+                to_play.pop();
+            } else {
+                played_pos = to_guess;
+                to_guess = W * H;   // This indicates game_player thread that the guess was played.
+            }
         }
-        groups.erase(guess_group_it);
-        // delete g;
+        std::pair<int, int> coords = get_coords(played_pos);
+        std::cout << coords.first << " " << coords.second << std::endl;
+
         // throw std::runtime_error("stop after first turn!");
     }
+}
+
+void game_player(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_compute, std::mutex to_compute_mtx, std::queue<Pos> & to_play, Pos & to_guess, std::mutex & to_play_mtx) {
+    std::vector<Group*> groups;
+    std::array<double, CELLS_COUNT> cells_safety;
+    double guess_safety;
+    Pos cell;
+    Group * cell_group;
+    std::unique_lock<std::mutex> to_compute_lck {to_compute_mtx};
+
+    std::fill(std::begin(cells_safety), std::end(cells_safety), 0.0);
+    guess_safety = 0.0;
+
+    while (true) {
+        game_player_cv.wait(to_compute_lck, [&to_compute]{return !to_compute.empty();});
+        if (to_guess < 0 || CELLS_COUNT <= to_guess) {
+            guess_safety = 0.0;
+            for (Group const* g: groups) {
+                for (Pos p: g->unknown_cells) {
+                    if (guess_safety < cells_safety[p] && cells_safety[p] < 1.0) {
+                        std::lock_guard<std::mutex> lck(to_play_mtx);
+                        to_guess = p;
+                        guess_safety = cells_safety[p];
+                    }
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lck(to_compute_mtx);
+            cell = to_compute.front();
+            to_compute.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lck(grid_mtx);
+            cell_group = get_cell_group(grid, cell, groups);
+        }
+        for (Pos p: cell_group->unknown_cells) {
+            cells_safety[p] = 1.0;
+        }
+        for (auto const& poss: cell_group->possibilities) {
+            double const step = 1.0 / poss.size();
+            for (Pos p: poss) {
+                cells_safety[p] -= step;
+            }
+        }
+        for (Pos const& p: cell_group->unknown_cells) {
+            if (cells_safety[p] == 1.0) {    // Safe cell
+                {
+                    std::lock_guard<std::mutex> lck(to_play_mtx);
+                    to_play.push(p);
+                }
+            } else if (cells_safety[p] > guess_safety) {
+                {
+                    std::lock_guard<std::mutex> lck(to_play_mtx);
+                    to_guess = p;
+                    guess_safety = cells_safety[p];
+                }
+            }
+
+        }
+    }
+}
+
+int main(void) {
+    Grid grid;
+    std::mutex grid_mtx;
+    std::queue<Pos> to_compute;
+    Pos to_guess;
+    std::mutex to_compute_mtx;
+    std::queue<Pos> to_play;
+    std::mutex to_play_mtx;
+
+    std::thread my_game_interface(game_interface, std::ref(grid), std::ref(grid_mtx), std::ref(to_compute), std::ref(to_guess), std::ref(to_compute_mtx), std::ref(to_play), std::ref(to_play_mtx));
+    std::thread my_player(game_player, std::ref(grid), std::ref(grid_mtx), std::ref(to_compute), std::ref(to_guess), std::ref(to_compute_mtx), std::ref(to_play), std::ref(to_play_mtx));
+
+    my_game_interface.join();
+    my_player.join();
     return (0);
 }
