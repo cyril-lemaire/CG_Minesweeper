@@ -5,6 +5,7 @@
 // trigger optimisation from source file
 // # pragma GCC optimize("Ofast", "inline", "omit-frame-pointer", "unroll-loops")
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <set>
@@ -30,6 +31,11 @@ std::condition_variable game_player_cv;
 
 typedef std::array<char, CELLS_COUNT> Grid;
 typedef uint16_t Pos;
+/*
+struct Grid: public std::array<char, CELLS_COUNT> {
+    size_t remaining_bombs;
+}
+*/
 
 inline Pos get_pos(int x, int y) {
     if (x < 0 || x >= W || y < 0 || y >= H) {
@@ -100,6 +106,13 @@ struct Group {
 
     Group(std::set<Pos> const& known_cells, std::set<Pos> const& unknown_cells): known_cells {known_cells}, unknown_cells {unknown_cells}, possibilities {{}} {}
 
+    void mark_safe(Pos p) {
+        if (unknown_cells.find(p) == std::end(unknown_cells)) {
+            std::ostringstream oss;
+            oss << "Error! Can't mark pos " << p << " as safe, it's not in group unknown cells " << unknown_cells << "!";
+            throw std::runtime_error(oss.str());
+        }
+    }
     void merge(Group const* group, std::set<Pos> const& common_cells) {
         // std::cerr << "Merging groups with common key " << common_cells << ":\n";
         std::map<std::set<Pos>, std::vector<std::set<Pos>>> my_poss_by_common;
@@ -308,7 +321,7 @@ void game_interface(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_com
     std::set<Pos> computed_cells;
     Pos played_pos;
 
-    to_guess = W * H;   // This indicates the game_player that the guess was played.
+    to_guess = W * H;   // This indicates the game_player that the guess was NOT played. (setup only)
     read_grid(grid);
     std::cout << W / 2 << " " << H / 2 << std::endl;    // First move in the middle of the grid
 
@@ -347,7 +360,7 @@ void game_interface(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_com
     }
 }
 
-void game_player(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_compute, std::mutex to_compute_mtx, std::queue<Pos> & to_play, Pos & to_guess, std::mutex & to_play_mtx) {
+void game_player(Grid const& grid, std::mutex & grid_mtx, std::queue<Pos> & to_compute, std::mutex to_compute_mtx, std::queue<Pos> & to_play, Pos & to_guess, std::mutex & to_play_mtx) {
     std::vector<Group*> groups;
     std::array<double, CELLS_COUNT> cells_safety;
     double guess_safety;
@@ -360,18 +373,6 @@ void game_player(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_comput
 
     while (true) {
         game_player_cv.wait(to_compute_lck, [&to_compute]{return !to_compute.empty();});
-        if (to_guess < 0 || CELLS_COUNT <= to_guess) {
-            guess_safety = 0.0;
-            for (Group const* g: groups) {
-                for (Pos p: g->unknown_cells) {
-                    if (guess_safety < cells_safety[p] && cells_safety[p] < 1.0) {
-                        std::lock_guard<std::mutex> lck(to_play_mtx);
-                        to_guess = p;
-                        guess_safety = cells_safety[p];
-                    }
-                }
-            }
-        }
         {
             std::lock_guard<std::mutex> lck(to_compute_mtx);
             cell = to_compute.front();
@@ -380,6 +381,26 @@ void game_player(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_comput
         {
             std::lock_guard<std::mutex> lck(grid_mtx);
             cell_group = get_cell_group(grid, cell, groups);
+        }
+        {
+            std::lock_guard lck(to_play_mtx);
+            if (guess_safety == 0.0 && 0 <= to_guess && to_guess < CELLS_COUNT) {
+                // Guess was made.
+                for (Group * g: groups) {
+                    if (g->unknown_cells.find(to_guess) != std::end(g->unknown_cells)) {
+                        g->mark_safe(to_guess);
+                        cells_safety[to_guess] = 0.0;
+                        for (Pos p = 0; p < CELLS_COUNT; ++p) {
+                            if (cells_safety[p] > guess_safety) {
+                                std::lock_guard<std::mutex> lck(to_play_mtx);
+                                to_guess = p;
+                                guess_safety = cells_safety[p];
+                            }
+                        }
+                    }
+                }
+
+            }
         }
         for (Pos p: cell_group->unknown_cells) {
             cells_safety[p] = 1.0;
@@ -392,16 +413,12 @@ void game_player(Grid & grid, std::mutex & grid_mtx, std::queue<Pos> & to_comput
         }
         for (Pos const& p: cell_group->unknown_cells) {
             if (cells_safety[p] == 1.0) {    // Safe cell
-                {
-                    std::lock_guard<std::mutex> lck(to_play_mtx);
-                    to_play.push(p);
-                }
+                std::lock_guard<std::mutex> lck(to_play_mtx);
+                to_play.push(p);
             } else if (cells_safety[p] > guess_safety) {
-                {
-                    std::lock_guard<std::mutex> lck(to_play_mtx);
-                    to_guess = p;
-                    guess_safety = cells_safety[p];
-                }
+                std::lock_guard<std::mutex> lck(to_play_mtx);
+                to_guess = p;
+                guess_safety = cells_safety[p];
             }
 
         }
@@ -417,10 +434,10 @@ int main(void) {
     std::queue<Pos> to_play;
     std::mutex to_play_mtx;
 
-    std::thread my_game_interface(game_interface, std::ref(grid), std::ref(grid_mtx), std::ref(to_compute), std::ref(to_guess), std::ref(to_compute_mtx), std::ref(to_play), std::ref(to_play_mtx));
-    std::thread my_player(game_player, std::ref(grid), std::ref(grid_mtx), std::ref(to_compute), std::ref(to_guess), std::ref(to_compute_mtx), std::ref(to_play), std::ref(to_play_mtx));
+    std::thread my_interface(game_interface, std::ref(grid), std::ref(grid_mtx), std::ref(to_compute), std::ref(to_compute_mtx), std::ref(to_play), std::ref(to_guess), std::ref(to_play_mtx));
+    std::thread my_player(game_player, std::ref(grid), std::ref(grid_mtx), std::ref(to_compute), std::ref(to_compute_mtx), std::ref(to_play), std::ref(to_guess), std::ref(to_play_mtx));
 
-    my_game_interface.join();
+    my_interface.join();
     my_player.join();
     return (0);
 }
