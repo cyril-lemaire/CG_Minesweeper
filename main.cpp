@@ -1,6 +1,4 @@
-//----------------------------------------------------------------------------//
-//                                  includes                                  //
-//----------------------------------------------------------------------------//
+// Libraries
 
 // trigger optimisation from source file
 // # pragma GCC optimize("Ofast", "inline", "omit-frame-pointer", "unroll-loops")
@@ -8,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <array>
 #include <set>
 #include <array>
 #include <map>
@@ -17,7 +16,10 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <condition_variable>
 
+
+// Constants
 
 constexpr int W = 30;
 constexpr int H = 16;
@@ -26,16 +28,31 @@ constexpr int CELLS_COUNT = W * H;
 constexpr std::chrono::duration FIRST_TURN_DURATION = std::chrono::seconds(1);
 constexpr std::chrono::duration TURN_DURATION = std::chrono::milliseconds(50);
 constexpr std::chrono::duration TIME_EPSILON = std::chrono::microseconds(1000);
+constexpr int BOMBS_COUNT = 99;
 
-std::condition_variable game_player_cv;
+
+// Types
 
 typedef std::array<char, CELLS_COUNT> Grid;
 typedef uint16_t Pos;
-/*
-struct Grid: public std::array<char, CELLS_COUNT> {
-    size_t remaining_bombs;
-}
-*/
+enum Status {
+	READING,
+	PROCESSING,
+	WRITING,
+};
+struct Group;
+
+// Globals
+
+Status status;
+std::mutex status_mtx;
+std::condition_variable player_cv;
+std::condition_variable interface_cv;
+std::array<CELLS_COUNT, float> cells_safety;
+std::mutex cells_safety_mtx;
+
+
+// Functions
 
 inline Pos get_pos(int x, int y) {
     if (x < 0 || x >= W || y < 0 || y >= H) {
@@ -151,12 +168,51 @@ struct Group {
         unknown_cells.insert(std::begin(group->unknown_cells), std::end(group->unknown_cells));
         possibilities = new_possibilities;
     }
+
+    void find_safe_cells(std::set<Pos> & safe_cells, std::mutex & safe_cells_mtx) const {
+        std::set<Pos> valid_cells {unknown_cells};
+
+        for (auto const& poss: possibilities) {
+            for (Pos p: poss) {
+                valid_cells.erase(p);
+            }
+        }
+        std::lock_guard<std::mutex> lck(safe_cells_mtx);
+        safe_cells.insert(std::begin(valid_cells), std::end(valid_cells));
+    }
+
+    void find_safest_cell(Pos & guess, double & guess_safety, std::mutex & guess_mtx, std::set<Pos> & safe_cells, std::mutex & safe_cells_mtx) const {
+        std::map<Pos, size_t> cells_safety;
+
+        for (Pos p: unknown_cells) {
+            cells_safety[p] = possibilities.size();
+        }
+        for (auto const& poss: possibilities) {
+            for (Pos p: poss) {
+                --cells_safety[p];
+            }
+        }
+        for (auto const& kv_pair: cells_safety) {
+            Pos const p = kv_pair.first;
+            double const p_safety = static_cast<double>(kv_pair.second) / possibilities.size();
+            if (p_safety == 1.0 || p_safety > guess_safety ) {
+                if (p_safety == 1.0) {
+                    std::lock_guard<std::mutex> lck(safe_cells_mtx);
+                    safe_cells.insert(p);
+                }
+                std::lock_guard<std::mutex> lck(guess_mtx);
+                guess = p;
+                guess_safety = p_safety;
+            }
+        }
+    }
 };
 
 std::ostream& operator<<(std::ostream& os, Grid const& grid) {
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             if (x > 0) {
+
                 os << " ";
             }
             os << grid[get_pos(x, y)];
